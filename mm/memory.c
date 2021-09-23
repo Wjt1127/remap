@@ -82,6 +82,18 @@
 
 #include "internal.h"
 
+#include <linux/syscalls.h>
+#include <linux/kvremap.h>
+
+struct kvremap_range g_kvremap_range = {
+	.saddr = 0,
+	.len = 0,
+	.daddr = 0,
+	.cow = 0,
+	.pid = 0,
+};
+
+
 #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
 #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
 #endif
@@ -2279,6 +2291,16 @@ static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
 	return GFP_KERNEL;
 }
 
+static int in_kvremap_range(int pid, unsigned long addr)
+{
+	if(pid == g_kvremap_range.pid && g_kvremap_range.len > 0 && 
+		addr >= g_kvremap_range.daddr && addr < g_kvremap_range.daddr + g_kvremap_range.len)
+		return 1;
+	else
+		return 0;
+}
+
+
 /*
  * Notify the address space that the page is about to become writable so that
  * it can prohibit this or wait for the page to get into an appropriate state.
@@ -2446,6 +2468,15 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 			if (old_page)
 				put_page(old_page);
 			return 0;
+		}
+
+		if(current->pid == g_kvremap_range.pid)
+		{
+			g_kvremap_range.cow++;
+			if(g_kvremap_range.cow % 100 == 1)
+			{
+				printk("g_kvremap_range.cow = %lu\n", g_kvremap_range.cow);
+			}
 		}
 	}
 
@@ -2873,6 +2904,223 @@ void unmap_mapping_range(struct address_space *mapping,
 	unmap_mapping_pages(mapping, hba, hlen, even_cows);
 }
 EXPORT_SYMBOL(unmap_mapping_range);
+
+SYSCALL_DEFINE4(kvremap, unsigned long, saddr, unsigned long, len, unsigned long, daddr, int, pid)
+{
+    pgd_t *src_pgd = NULL, *dst_pgd = NULL;
+	p4d_t *src_p4d = NULL, *dst_p4d = NULL;
+    pud_t *src_pud = NULL, *dst_pud = NULL;
+    pmd_t *src_pmd = NULL, *dst_pmd = NULL;
+    pte_t *src_pte = NULL, *dst_pte = NULL, entry;
+	struct vm_area_struct *svma = NULL, *dvma = NULL;
+	struct mm_struct *mm = current->mm;
+	struct page *page;
+	unsigned long remap_len = 0, send, dend;
+	int ret = 0;
+	// spinlock_t *ptl;
+
+	printk("sys_kvremap saddr = %#lx, len = %lu, daddr = %#lx, pid = %d\n", saddr, len, daddr, pid);
+
+	if(pid == g_kvremap_range.pid && daddr == g_kvremap_range.daddr + len)
+	{
+		g_kvremap_range.saddr = saddr;
+		g_kvremap_range.len += len;
+	}
+	else
+	{
+		if(pid != g_kvremap_range.pid)
+		{
+			g_kvremap_range.cow = 0;
+			g_kvremap_range.pid = pid;
+		}
+		g_kvremap_range.saddr = saddr;
+		g_kvremap_range.len = len;
+		g_kvremap_range.daddr = daddr;
+	}
+
+	if(saddr == 0 || daddr == 0) return 0;
+
+	send = saddr + len;
+	dend = daddr + len;
+
+	if ((svma=find_vma(mm, saddr)) == NULL || (dvma=find_vma(mm, daddr)) == NULL || svma->vm_end < send || dvma->vm_end < dend)
+	{
+        printk("vma error, svma = %p, dvma = %p, send = %#lx, svma->vm_end = %#lx, dend = %#lx, dvma->vm_end = %#lx\n", svma, dvma, send, svma->vm_end, dend, dvma->vm_end);
+        return -ENOMEM;
+    }
+
+	do
+	{
+// pgd
+		src_pgd = pgd_offset(mm, saddr);
+		dst_pgd = pgd_offset(mm, daddr);
+
+		if (pgd_none(*src_pgd) || unlikely(pgd_bad(*src_pgd)))
+		{
+			printk("src_pgd error, saddr = %#lx\n", saddr);
+			ret = -ENOMEM;
+			break;
+		}
+		// printk("src_pgd val = %#lx, dst_pgd val = %#lx\n", pgd_val(*src_pgd), pgd_val(*dst_pgd));
+
+// p4d
+		// dst_p4d = p4d_offset(dst_pgd, daddr);
+		// if (!dst_p4d)
+		// {
+			dst_p4d = p4d_alloc(mm, dst_pgd, daddr);
+			if (!dst_p4d)
+			{
+				printk("dst_p4d error, daddr = %#lx\n", daddr);
+				ret = -ENOMEM;
+				break;
+			}
+		// }
+
+		src_p4d = p4d_offset(src_pgd, saddr);
+		if (p4d_none(*src_p4d) || unlikely(p4d_bad(*src_p4d)))
+		{
+			printk("src_p4d error, saddr = %#lx\n", saddr);
+			ret = -ENOMEM;
+			break;
+		}
+		// printk("src_p4d val = %#lx, dst_p4d val = %#lx\n", p4d_val(*src_p4d), p4d_val(*dst_p4d));
+
+// pud
+		// dst_pud = pud_offset(dst_p4d, daddr);
+		// if (!dst_pud)
+		// {
+			dst_pud = pud_alloc(mm, dst_p4d, daddr);
+			if (!dst_pud)
+			{
+				printk("dst_pud error, daddr = %#lx\n", daddr);
+				ret = -ENOMEM;
+				break;
+			}
+		// }
+
+		src_pud = pud_offset(src_p4d, saddr);
+
+		if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud))  // close transparent_hugepage
+		{
+			printk("pud_trans_huge || pud_devmap, saddr = %#lx\n", saddr);
+			ret = -ENOMEM;
+			break;
+		}
+
+		if (pud_none(*src_pud) || unlikely(pud_bad(*src_pud)))
+		{
+			printk("src_pud error, saddr = %#lx\n", saddr);
+			ret = -ENOMEM;
+			break;
+		}
+		// printk("src_pud val = %#lx, dst_pud val = %#lx\n", pud_val(*src_pud), pud_val(*dst_pud));
+
+// pmd
+		// dst_pmd = pmd_offset(dst_pud, daddr);
+		// if(!dst_pmd)
+		// {
+			dst_pmd = pmd_alloc(mm, dst_pud, daddr);
+			if (!dst_pmd)
+			{
+				printk("dst_pmd error, daddr = %#lx\n", daddr);
+				ret = -ENOMEM;
+				break;
+			}
+		// }
+
+		src_pmd = pmd_offset(src_pud, saddr);
+
+		if (is_swap_pmd(*src_pmd) || pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd))  // close transparent_hugepage
+		{
+			printk("is_swap_pmd || pmd_trans_huge || pmd_devmap, saddr = %#lx\n", saddr);
+			ret = -ENOMEM;
+			break;
+		}
+
+		if (pmd_none(*src_pmd) || unlikely(pmd_bad(*src_pmd)))
+		{
+			printk("src_pmd error, saddr = %#lx, src_pmd val = %#lx, dst_pmd val = %#lx\n", saddr, pmd_val(*src_pmd), pmd_val(*dst_pmd));
+			ret = -ENOMEM;
+			break;
+		}
+		// printk("src_pmd val = %#lx, dst_pmd val = %#lx\n", pmd_val(*src_pmd), pmd_val(*dst_pmd));
+
+// pte
+		// dst_pte = pte_offset_map(dst_pmd, daddr);
+		// if(!dst_pte)
+		// {
+			dst_pte = pte_alloc_map(mm, dst_pmd, daddr);
+			if (!dst_pte)
+			{
+				printk("dst_pte error, daddr = %#lx\n", daddr);
+				ret = -ENOMEM;
+				break;
+			}
+		// }
+
+		// src_pte = pte_offset_map_lock(mm, src_pmd, saddr, &ptl);
+		src_pte = pte_offset_map(src_pmd, saddr);
+		if (pte_none(*src_pte))
+		{
+			printk("src_pte none, saddr = %#lx\n", saddr);
+			ret = -ENOMEM;
+			break;
+		}
+
+		entry = *src_pte;
+
+		page = vm_normal_page(svma, saddr, entry);
+		if (page)
+		{
+			// if (!trylock_page(page))
+			// {
+			// 	printk("trylock_page(page) error\n");
+			// }
+			get_page(page);  // increase page _refcount, a page with _refcount>1 can be CoW ed
+			page_dup_rmap(page, false);  // increase page _mapcount
+			inc_mm_counter_fast(mm, MM_ANONPAGES);
+			// page_add_anon_rmap(page, dvma, daddr, false);
+			// unlock_page(page);
+
+			// printk("page  = %p, ref count = %d\n", page, page->_refcount.counter);
+		}
+		else
+		{
+			printk("vm_normal_page error\n");
+			ret = -ENOMEM;
+			break;
+		}
+
+		if (is_cow_mapping(svma->vm_flags))
+		{
+			// ptep_set_wrprotect(mm, saddr, src_pte);
+			entry = pte_wrprotect(entry);
+		}
+		else
+		{
+			printk("ptep_set_wrprotect error, saddr = %#lx\n", saddr);
+			ret = -ENOMEM;
+			break;
+		}
+
+		set_pte_at(mm, daddr, dst_pte, entry);
+		/* No need to invalidate - it was non-present before */
+		update_mmu_cache(dvma, daddr, dst_pte);   // 更新TLB
+
+		if (pte_none(*dst_pte))
+		{
+			printk("set dst_pte error\n");
+			ret = -ENOMEM;
+			break;
+		}
+
+		// pte_unmap_unlock(src_pte, ptl);
+	} while(remap_len += PAGE_SIZE, saddr += PAGE_SIZE, daddr += PAGE_SIZE, remap_len < len);
+
+	// printk("sys_kvremap saddr = %#lx, send = %#lx, daddr = %#lx, dend = %#lx\n", saddr, send, daddr, dend);
+
+	return ret;
+}
 
 /*
  * We enter with non-exclusive mmap_sem (to exclude vma changes,
