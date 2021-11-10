@@ -16,3 +16,34 @@ several of them using the Restructured Text markup notation.
 Please read the Documentation/process/changes.rst file, as it contains the
 requirements for building and running the kernel, and information about
 the problems which may result by upgrading your kernel.
+
+
+
+### 禁用大内存页面 transparent_hugepage=never
+
+* 编辑 /etc/default/grub，在GRUB_CMDLINE_LINUX加入选项 transparent_hugepage=never
+
+```bash
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
+GRUB_DEFAULT=saved
+GRUB_DISABLE_SUBMENU=true
+GRUB_TERMINAL_OUTPUT="console"
+GRUB_CMDLINE_LINUX="rd.lvm.lv=fedora/swap rd.lvm.lv=fedora/root rhgb quiet transparent_hugepage=never"
+GRUB_DISABLE_RECOVERY="true"
+
+```
+
+* 重新生成grub配置文件
+
+```bash
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+```
+
+* 重启系统,查询hugepage状态
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled 
+
+always madvise [never]
+```
